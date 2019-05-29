@@ -24,11 +24,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_set>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
 
 #include "boost/filesystem.hpp"
 #include "common/network_util.h"
 #include "common/rocksdb_glogger/rocksdb_glogger.h"
 #include "common/thrift_router.h"
+#include "librdkafka/rdkafkacpp.h"
+#include "common/kafka/kafka_broker_file_watcher.h"
+#include "common/kafka/kafka_consumer_pool.h"
+#include "common/kafka/kafka_watcher.h"
+#include "common/timeutil.h"
 #include "folly/FileUtil.h"
 #include "folly/ScopeGuard.h"
 #include "folly/String.h"
@@ -76,10 +85,45 @@ DEFINE_int32(max_s3_sst_loading_concurrency, 999,
 
 DEFINE_int32(s3_download_limit_mb, 0, "S3 download sst bandwidth");
 
+DECLARE_int32(kafka_consumer_timeout_ms);
+DEFINE_int32(kafka_watcher_init_blocking_consume_timeout_ms,
+             0,
+             "The time limit used to blocking consume add document kafka messages until the "
+             "current timestamp when initializing index segment manager");
+DEFINE_int32(kafka_watcher_loop_cycle_limit_ms,
+             10000,
+             "The time limit for payload update in each loop cycle.");
+
 namespace {
 
 const int kMB = 1024 * 1024;
 const int kS3UtilRecheckSec = 5;
+
+const int64_t kMillisPerSec = 1000;
+const char kKafkaConsumerType[] = "kafka_message_logger";
+const char kKafkaWatcherName[] = "KafkaMessageLogger";
+const uint32_t kKafkaConsumerPoolSize = 1;
+std::unordered_map<std::int64_t, std::shared_ptr<KafkaWatcher>> kafka_watcher_map;
+
+
+int64_t GetMessageTimestampSecs(const RdKafka::Message& message) {
+  const auto ts = message.timestamp();
+  if (ts.type == RdKafka::MessageTimestamp::MSG_TIMESTAMP_CREATE_TIME) {
+    return ts.timestamp / kMillisPerSec;
+  }
+
+  // We only expect the timestamp to be create time.
+  return -1;
+}
+
+std::string ToUTC(const int64_t time_secs) {
+  time_t raw_time(time_secs);
+  char buf[24];
+  static const std::string time_format = "%Y-%d-%m %H:%M:%S UTC";
+  std::strftime(buf, sizeof(buf), time_format.c_str(), std::gmtime(&raw_time));
+  return std::string(buf);
+}
+
 
 rocksdb::DB* OpenMetaDB() {
   rocksdb::Options options;
@@ -927,6 +971,122 @@ void AdminHandler::async_tm_addS3SstFilesToDB(
   }
 
   callback->result(AddS3SstFilesToDBResponse());
+}
+
+int AdminHandler::get_partition_id_from_db_name(const std::string& db_name) {
+  size_t const n = db_name.find_first_of("0123456789");
+  if (n != std::string::npos){
+    return std::stoi(db_name.substr(n, std::string::npos));
+  }
+  LOG(ERROR) << "No partition id found in db name " << db_name;
+
+  return -1;
+}
+
+void AdminHandler::async_tm_startMessageIngestion(
+    std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
+      StartMessageIngestionResponse>>> callback,
+    std::unique_ptr<StartMessageIngestionRequest> request) {
+
+  auto db_name = request->db_name;
+  auto topic_name = request->topic_name;
+  auto kafka_broker_serverset_path = request->kafka_broker_serverset_path;
+  auto replay_timestamp_ms = request->replay_timestamp_ms;
+
+  auto partition_id = get_partition_id_from_db_name(db_name);
+  std::unordered_set<uint32_t> partition_ids_set({partition_id});
+  ::kafka::KafkaBrokerFileWatcher kafka_broker_file_watcher(
+      kafka_broker_serverset_path);
+
+
+  // Init topic inspector
+  auto kafka_consumer_pool = std::make_shared<::kafka::KafkaConsumerPool>(
+      kKafkaConsumerPoolSize,
+      partition_ids_set,
+      kafka_broker_file_watcher.GetKafkaBrokerList(),
+      std::unordered_set<std::string>({topic_name}),
+      "hostname",
+      kKafkaConsumerType);
+
+  auto kafka_watcher =
+      std::make_shared<KafkaWatcher>(kKafkaWatcherName,
+                                     kafka_consumer_pool
+                                     );
+
+  kafka_watcher_map[partition_id] = kafka_watcher;
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::atomic<bool> is_consume_caught_up(false);
+
+  int64_t message_count = 0;
+
+  const int64_t end_timestamp_secs =
+      common::timeutil::GetCurrentTimestamp(common::timeutil::kSecond);
+
+  kafka_watcher->StartWith(
+      replay_timestamp_ms,
+      [&cv,
+      &is_consume_caught_up,
+      end_timestamp_secs,
+      &partition_ids_set,
+      &message_count](std::shared_ptr<const RdKafka::Message> message,
+          const bool is_replay) {
+    if (message == nullptr) {
+      LOG(ERROR) << "Message nullptr";
+      return;
+    }
+    const int64_t msg_timestamp_secs = GetMessageTimestampSecs(*message);
+//    const auto partition_id = message->partition();
+
+    // Signal complete once we reach end time
+    if (msg_timestamp_secs >= end_timestamp_secs) {
+      is_consume_caught_up.store(true);
+      cv.notify_all();
+    }
+    ++message_count;
+
+    if ((message_count % 1000000) == 0) {
+      std::cout <<"message count" << message_count << std::endl;
+    }
+
+    LOG(INFO) << "Key: " << *message->key() << ", "
+    //                  << "event: " << event << ", "
+    << "partition: " << message->partition() << ", "
+    << "offset: " << message->offset() << ", "
+    << "payload len: " << message->len() << ", "
+    << "msg_timestamp: " << ToUTC(msg_timestamp_secs) << " or "
+    << std::to_string(msg_timestamp_secs) << " secs";
+
+    std::cout << "Key " << *message->key() << ", "
+    << " value " << static_cast<const char *>(message->payload()) << ", "
+    << " msg_timestamp: " << ToUTC(msg_timestamp_secs) << " or "
+    << std::to_string(msg_timestamp_secs) << " secs" <<std::endl;
+  });
+
+
+  std::unique_lock<std::mutex> lock(mutex);
+  cv.wait(lock, [&is_consume_caught_up] { return is_consume_caught_up.load(); });
+  std::cout << "message_count "<< message_count << std::endl;
+
+  std::cout << "now consuming live messages "<< message_count << std::endl;
+
+}
+
+void AdminHandler::async_tm_stopMessageIngestion(
+    std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
+      StopMessageIngestionResponse>>> callback,
+    std::unique_ptr<StopMessageIngestionRequest> request) {
+
+  auto db_name = request->db_name;
+
+  auto partition_id = get_partition_id_from_db_name(db_name);
+
+  auto kafka_watcher = kafka_watcher_map[partition_id];
+
+  LOG(INFO) << "Stopping kafka watcher";
+  kafka_watcher->StopAndWait();
+  LOG(INFO) << "Kafka watcher stopped";
 }
 
 void AdminHandler::async_tm_setDBOptions(

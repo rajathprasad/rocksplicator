@@ -98,6 +98,16 @@ class AdminHandler : virtual public AdminSvIf {
         AddS3SstFilesToDBResponse>>> callback,
       std::unique_ptr<AddS3SstFilesToDBRequest> request) override;
 
+  void async_tm_startMessageIngestion(
+      std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
+          StartMessageIngestionResponse>>> callback,
+  std::unique_ptr<StartMessageIngestionRequest> request) override;
+
+  void async_tm_stopMessageIngestion(
+      std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
+          StopMessageIngestionResponse>>> callback,
+  std::unique_ptr<StopMessageIngestionRequest> request) override;
+
   void async_tm_setDBOptions(
       std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
         SetDBOptionsResponse>>> callback,
@@ -117,6 +127,8 @@ class AdminHandler : virtual public AdminSvIf {
  private:
   std::unique_ptr<rocksdb::DB> removeDB(const std::string& db_name,
                                         AdminException* ex);
+
+  int get_partition_id_from_db_name(const std::string& db_name);
 
   DBMetaData getMetaData(const std::string& db_name);
   bool clearMetaData(const std::string& db_name);
